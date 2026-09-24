@@ -915,6 +915,7 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     if (options.poolSize && options.poolSize > 1) {
       this.pool = new ConnectionPool({
         poolSize: options.poolSize,
+        maxConnections: options.maxConnections,
         maxSubscriptionsPerConnection: options.maxSubscriptionsPerConnection,
         idleTimeoutMs: options.idleTimeoutMs,
         rpcUrl: options.rpcUrl ?? RPC_URLS[this.network],
@@ -3198,6 +3199,46 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     return { txHash };
   }
 
+  /**
+   * Pauses an active stream (alias of {@link pause}). Encodes the pause
+   * instruction and submits it as a transaction. While paused, no new
+   * claimable tokens accumulate.
+   *
+   * @param params - Pause parameters.
+   * @param params.streamId - ID of the stream to pause.
+   * @param signal - Optional `AbortSignal` to cancel in-flight transaction polling.
+   * @param options - Optional write options.
+   * @returns `{ txHash }` — confirming transaction hash.
+   * @throws {TransactionFailedError} If the transaction is rejected (e.g. stream already paused).
+   */
+  async pauseStream(
+    params: PauseStreamParams,
+    signal?: AbortSignal,
+    options?: WriteOptions,
+  ): Promise<{ txHash: string }> {
+    return this.pause(params, signal, options);
+  }
+
+  /**
+   * Resumes a previously paused stream (alias of {@link resume}). Encodes the
+   * resume instruction and submits it as a transaction. Claimable tokens will
+   * again accumulate.
+   *
+   * @param params - Resume parameters.
+   * @param params.streamId - ID of the stream to resume.
+   * @param signal - Optional `AbortSignal` to cancel in-flight transaction polling.
+   * @param options - Optional write options.
+   * @returns `{ txHash }` — confirming transaction hash.
+   * @throws {TransactionFailedError} If the transaction is rejected (e.g. stream is not paused).
+   */
+  async resumeStream(
+    params: ResumeStreamParams,
+    signal?: AbortSignal,
+    options?: WriteOptions,
+  ): Promise<{ txHash: string }> {
+    return this.resume(params, signal, options);
+  }
+
   // ── Fee estimation ────────────────────────────────────────────────────────
 
   private async estimateOperationFee(operation: xdr.Operation): Promise<FeeEstimate> {
@@ -5255,7 +5296,7 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     if (this.pool) {
       const stats = this.pool.getStats();
       return {
-        maxConnections: stats.total,
+        maxConnections: this.pool.maxConnections,
         active: stats.active,
         idle: stats.idle,
         reused: 0,
