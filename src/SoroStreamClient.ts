@@ -3138,17 +3138,61 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     return { txHash };
   }
 
-  /**
-   * Pauses an active stream. While paused, no new claimable tokens accumulate.
-   *
-   * @param params - Pause parameters.
-   * @param params.streamId - ID of the stream to pause.
-   * @param signal - Optional `AbortSignal` to cancel in-flight transaction polling.
-   * @param options - Optional write options.
-   * @returns `{ txHash }` — confirming transaction hash.
-   * @throws {TransactionFailedError} If the transaction is rejected (e.g. stream already paused).
-   */
-  async pause(
+/**
+    * Transfers a stream to a new recipient address.
+    *
+    * @param params - Transfer recipient parameters.
+    * @param params.streamId - ID of the stream to transfer.
+    * @param params.newRecipient - The new recipient Stellar address.
+    * @param signal - Optional `AbortSignal` to cancel in-flight transaction polling.
+    * @param options - Optional write options.
+    * @returns `{ txHash }` — confirming transaction hash.
+    * @throws {InvalidAddressError} If `newRecipient` is not a valid Stellar address.
+    * @throws {StreamNotFoundError} If the stream does not exist.
+    * @throws {TransactionFailedError} If the transaction fails.
+    */
+   async transferRecipient(
+     params: TransferStreamParams,
+     signal?: AbortSignal,
+     options?: WriteOptions,
+   ): Promise<{ txHash: string }> {
+     if (!isValidStellarAddress(params.newRecipient)) {
+       throw new InvalidAddressError(params.newRecipient);
+     }
+     const sender = await this.requireWalletAdapter().getPublicKey();
+     const operation = this.encoder.transferStream(params.streamId, sender, params.newRecipient);
+     const feeBump = this.resolveFeeBump(options?.feeBump);
+     const { txHash } = await this.buildAndSubmit(
+       operation,
+       signal,
+       feeBump,
+       'transferRecipient',
+       options?.memo,
+       options?.timeoutMs ?? options?.timeout,
+     );
+     this.clearStreamCache(params.streamId);
+     this.emit({
+       type: 'StreamTransferred',
+       streamId: params.streamId,
+       txHash,
+       ledger: 0, // placeholder, will be updated when transaction is confirmed
+       timestamp: Date.now(),
+       data: { newRecipient: params.newRecipient },
+     });
+     return { txHash };
+   }
+
+   /**
+    * Pauses an active stream. While paused, no new claimable tokens accumulate.
+    *
+    * @param params - Pause parameters.
+    * @param params.streamId - ID of the stream to pause.
+    * @param signal - Optional `AbortSignal` to cancel in-flight transaction polling.
+    * @param options - Optional write options.
+    * @returns `{ txHash }` — confirming transaction hash.
+    * @throws {TransactionFailedError} If the transaction is rejected (e.g. stream already paused).
+    */
+   async pause(
     params: PauseStreamParams,
     signal?: AbortSignal,
     options?: WriteOptions,
@@ -5756,11 +5800,38 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
         callbacks.add(cb);
         // Emit the last known total immediately if available
         if (lastTotal !== undefined) cb(lastTotal);
-      },
-    };
-  }
+},
+     };
+   };
 
-  // ── Issue #333: Fee estimation cache ─────────────────────────────────────
+   /**
+    * Returns the total claimable amount across all streams for a given recipient
+    * address. This is a one-time fetch of the total claimable balance.
+    *
+    * @param address - The recipient Stellar address to aggregate claimable for.
+    * @returns The total claimable amount in stroops across all streams for the address.
+    * @throws {Error} If there is an error fetching streams or claimable balances.
+    */
+   async getTotalClaimable(address: string): Promise<bigint> {
+     try {
+       const result = await this.getStreamsByRecipient(address);
+       const streams = Array.isArray(result) ? result : result.streams;
+
+       if (streams.length === 0) {
+         return 0n;
+       }
+
+       const amounts = await Promise.all(
+         streams.map((s) => this.getClaimable(s.id).catch(() => 0n)),
+       );
+       return amounts.reduce((sum, a) => sum + a, 0n);
+     } catch (error) {
+       // Re-throw to allow caller to handle
+       throw error;
+     }
+   }
+
+   // ── Issue #333: Fee estimation cache ─────────────────────────────────────
 
   /** Cache for fee estimation results. Key = operation type string. */
   private feeEstimationCache: Cache<string, FeeEstimate> | null = null;
