@@ -457,6 +457,13 @@ export interface SoroStreamClientOptions {
    * `debug`, `info`, `warn`, and `error` methods.
    */
   logger?: import('./logger.js').Logger;
+  /**
+   * Optional nonce provider for generating unique nonces to prevent transaction replay attacks (issue #554).
+   * If provided, the SDK will call this function to generate a nonce for each transaction.
+   * The nonce will be included in the transaction memo.
+   * If not provided, a default UUID-based nonce provider will be used.
+   */
+  nonceProvider?: () => string;
 }
 
 function nativeToStream(raw: Record<string, unknown>): Stream {
@@ -599,6 +606,10 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
    * Issue #230.
    */
   private readonly recipientCache = new Cache<string, Stream[]>(STREAM_CACHE_TTL_MS);
+  /** Per-tag streams cache, keyed by `${network}:${tag}`.
+   * Invalidated on every `setNetwork` call to prevent stale cross-network data.
+   */
+  private readonly tagCache = new Cache<string, Stream[]>(STREAM_CACHE_TTL_MS);
   /** Federation address resolution cache (5 min TTL). */
   private readonly federationCache = new Cache<string, string>(300_000);
   private readonly validateCliff: (cliffSeconds: number) => void | Promise<void>;
@@ -657,8 +668,10 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
   private readonly auditLogEnabled: boolean;
   // Issue #389: caller-supplied audit logger
   private readonly auditLogger: import('./types.js').AuditLogger | undefined;
-  // Issue #437: structured logger for SDK diagnostic messages
-  private readonly logger: Logger;
+// Issue #437: structured logger for SDK diagnostic messages
+   private readonly logger: Logger;
+   // Issue #554: nonce provider for transaction replay protection
+   private readonly nonceProvider: () => string;
   // Issue #391: timestamp of the most recent successful RPC call (ms)
   private lastRpcTimestampMs: number | null = null;
   // Issue #270: telemetry opt-out flag
@@ -721,6 +734,8 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
   /** Issue #516: "any" subscribers — receive every stream event type. */
   private readonly _anySubscribers = new Map<string, (event: StreamEvent<TEventData>) => void>();
   private _anySubscriberCounter = 0;
+   /** Subscription for StreamCancelled contract events to invalidate cache. */
+   private readonly streamCancelledSubscription: ReturnType<typeof this.getEventPoller['subscribe']> | null = null;
   /** Event bus used to emit SDK lifecycle events. Issue #212. */
   private eventBus: IEventBus;
   /** Issue: cross-tab event relay (BroadcastChannel). Null when disabled. */
@@ -887,8 +902,23 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     this.batchingOptions = options.batchingOptions;
     this.auditLogEnabled = options.auditLog ?? false;
     this.auditLogger = options.auditLogger;
-    // Issue #437: structured logger — default to NoopLogger when not provided
-    this.logger = options.logger ?? new NoopLogger();
+// Issue #437: structured logger — default to NoopLogger when not provided
+   this.logger = options.logger ?? new NoopLogger();
+   // Issue #554: nonce provider — default to UUID-based generator (16 random bytes as MemoHash)
+   this.nonceProvider = options.nonceProvider ?? (() => {
+     // Use crypto.getRandomValues if available (modern browsers and Node.js)
+     if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+       const array = new Uint8Array(16);
+       crypto.getRandomValues(array);
+       return array;
+     }
+     // Fallback to simple random byte generation
+     const array = new Uint8Array(16);
+     for (let i = 0; i < 16; i++) {
+       array[i] = Math.floor(Math.random() * 256);
+     }
+     return array;
+   });
     this.telemetryEnabled = options.telemetry !== false;
     this.storageAdapter = options.adapters?.storage ?? getDefaultStorageAdapter();
     this.fetchAdapter = options.adapters?.fetch ?? getDefaultFetchAdapter() ?? fetch;
@@ -959,21 +989,23 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
    * is garbage-collected, and Node.js interval handles are `unref()`'d so they
    * do not keep the event loop alive (issue #412).
    */
-  destroy(): void {
-    if (this.destroyed) return;
-    this.destroyed = true;
-    clientFinalizers?.unregister(this);
-    this.eventPoller = null;
-    this.pool = null;
-    // Issue #423: drop shared observables so their poll loops are not kept
-    // reachable after teardown. `runClientCleanup` stops the timers themselves.
-    this.streamObservables.clear();
-    this.claimableObservables.clear();
-    runClientCleanup(this.ownedTimers);
-    // Sever the relay from the event bus so post-destroy emits are no-ops.
-    this.crossTabRelay = null;
-    if (this.crossTabEventBus) this.crossTabEventBus.relay = null;
-  }
+destroy(): void {
+     if (this.destroyed) return;
+     this.destroyed = true;
+     clientFinalizers?.unregister(this);
+     this.eventPoller = null;
+     this.pool = null;
+     // Issue #423: drop shared observables so their poll loops are not kept
+     // reachable after teardown. `runClientCleanup` stops the timers themselves.
+     this.streamObservables.clear();
+     this.claimableObservables.clear();
+     // Issue #545: unsubscribe from StreamCancelled contract events
+     this.streamCancelledSubscription?.unsubscribe();
+     runClientCleanup(this.ownedTimers);
+     // Sever the relay from the event bus so post-destroy emits are no-ops.
+     this.crossTabRelay = null;
+     if (this.crossTabEventBus) this.crossTabEventBus.relay = null;
+   }
 
   /**
    * Re-opens the cross-tab channel for the current network scope, replacing
@@ -1429,6 +1461,7 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     this.streamCache.clear();
     this.senderCache.clear();
     this.recipientCache.clear();
+    this.tagCache.clear();
     this.federationCache.clear();
     // Issue #221 & #426: drop in-flight request tracking on a network switch so
     // a pending read against the previous network is never handed to a caller
@@ -1851,14 +1884,66 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
       { ...this.submitRetry, signal },
     );
 
-    const txBuilder = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: NETWORK_PASSPHRASES[this.network],
-    }).addOperation(operation);
+const txBuilder = new TransactionBuilder(account, {
+       fee: BASE_FEE,
+       networkPassphrase: NETWORK_PASSPHRASES[this.network],
+     }).addOperation(operation);
 
-    if (memo !== undefined) {
-      txBuilder.addMemo(this.buildMemo(memo));
-    }
+     // Issue #554: Add nonce from nonceProvider if available
+     let finalMemo: string | MemoHash | undefined = memo;
+     if (this.nonceProvider) {
+       const nonceBytes = this.nonceProvider(); // This is now always a Uint8Array
+       
+       if (memo !== undefined) {
+         // Both user memo and nonceProvider are present - combine them
+         let combinedBytes: Uint8Array;
+         if (typeof memo === 'string') {
+           // User memo is string - convert to bytes
+           const memoBytes = new TextEncoder().encode(memo);
+           // Combine nonceBytes + memoBytes
+           combinedBytes = new Uint8Array(nonceBytes.length + memoBytes.length);
+           combinedBytes.set(nonceBytes, 0);
+           combinedBytes.set(memoBytes, nonceBytes.length);
+         } else {
+           // User memo is already MemoHash (Uint8Array) - combine the byte arrays
+           combinedBytes = new Uint8Array(nonceBytes.length + memo.length);
+           combinedBytes.set(nonceBytes, 0);
+           combinedBytes.set(memo, nonceBytes.length);
+         }
+         
+         // If too long, truncate; if too short, pad with zeros to 32 bytes
+         if (combinedBytes.length > 32) {
+           // Truncate to 32 bytes
+           finalMemo = combinedBytes.slice(0, 32) as MemoHash;
+         } else if (combinedBytes.length < 32) {
+           // Pad to 32 bytes
+           const padded = new Uint8Array(32);
+           padded.set(combinedBytes, 0);
+           finalMemo = padded as MemoHash;
+         } else {
+           // Exactly 32 bytes
+           finalMemo = combinedBytes as MemoHash;
+         }
+       } else {
+         // No user memo, use nonce as memo (pad to 32 bytes if needed)
+         if (nonceBytes.length > 32) {
+           // Truncate to 32 bytes
+           finalMemo = nonceBytes.slice(0, 32) as MemoHash;
+         } else if (nonceBytes.length < 32) {
+           // Pad to 32 bytes
+           const padded = new Uint8Array(32);
+           padded.set(nonceBytes, 0);
+           finalMemo = padded as MemoHash;
+         } else {
+           // Exactly 32 bytes
+           finalMemo = nonceBytes as MemoHash;
+         }
+       }
+     }
+
+     if (finalMemo !== undefined) {
+       txBuilder.addMemo(this.buildMemo(finalMemo));
+     }
 
     const tx = txBuilder.setTimeout(30).build();
 
@@ -2770,10 +2855,13 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
       options?.timeoutMs ?? options?.timeout,
     );
 
-    // Issue #212: notify subscribers of the custom event bus.
-    this.eventBus.emit('stream.cancelled', { streamId: params.streamId, txHash });
+// Issue #212: notify subscribers of the custom event bus.
+     this.eventBus.emit('stream.cancelled', { streamId: params.streamId, txHash });
+     
+     // Issue #545: invalidate cache on stream cancellation
+     this.clearStreamCache(params.streamId);
 
-    return { txHash };
+     return { txHash };
   }
 
   /**
@@ -3194,11 +3282,88 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
       options?.memo,
       options?.timeoutMs ?? options?.timeout,
     );
-    this.clearStreamCache(params.streamId);
-    return { txHash };
-  }
+this.clearStreamCache(params.streamId);
+     return { txHash };
+   }
 
-  // ── Fee estimation ────────────────────────────────────────────────────────
+   /**
+    * Clones a stream by creating a new stream with the same parameters as the source
+    * stream. Optionally accepts overrides to modify certain parameters.
+    *
+    * @param streamId - ID of the source stream to clone.
+    * @param overrides - Optional parameters to override in the cloned stream.
+    *                    Can override recipient, startTime, endTime, or flowRate.
+    * @param signal - Optional AbortSignal to cancel the operation.
+    * @param options - Optional write options.
+    * @returns `{ streamId, txHash }` — the ID of the cloned stream and transaction hash.
+    * @throws {StreamNotFoundError} If the source stream is not found.
+    * @throws {InvalidAddressError} If the override recipient is not a valid Stellar address.
+    */
+   async cloneStream(
+     streamId: string,
+     overrides?: CloneStreamOverrides,
+     signal?: AbortSignal,
+     options?: WriteOptions,
+   ): Promise<{ streamId: string; txHash: string }> {
+     // First, get the source stream to copy its parameters
+     const sourceStream = await this.getStream(streamId);
+     
+     // Validate streamId format (this will throw if invalid)
+     parseStreamId(streamId);
+     
+     // Prepare parameters for the new stream
+     // Calculate duration from source stream
+     const sourceDuration = sourceStream.endTime - sourceStream.startTime;
+     const params: CreateStreamParams = {
+       recipient: overrides?.recipient ?? sourceStream.recipient,
+       token: sourceStream.token,
+       amount: sourceStream.deposit, // deposit is the original amount
+       durationSeconds: sourceDuration,
+       autoRenew: sourceStream.autoRenew,
+       startTime: overrides?.startTime ?? Math.floor(Date.now() / 1000), // Default to now
+     };
+     
+     // Apply overrides
+     if (overrides) {
+       if (overrides.recipient !== undefined) {
+         params.recipient = overrides.recipient;
+       }
+       if (overrides.startTime !== undefined) {
+         params.startTime = overrides.startTime;
+       }
+       if (overrides.endTime !== undefined) {
+         // endTime override: calculate duration from now to endTime
+         params.durationSeconds = Math.max(0, overrides.endTime - Math.floor(Date.now() / 1000));
+       }
+       if (overrides.flowRate !== undefined) {
+         // For flow rate override, we need to calculate the amount based on duration
+         // amount = flowRate * duration
+         params.amount = BigInt(overrides.flowRate) * BigInt(params.durationSeconds);
+       }
+     }
+     
+     // Validate duration is positive
+     if (params.durationSeconds <= 0) {
+       throw new Error('Stream duration must be positive');
+     }
+     
+     // Validate recipient address if it was overridden or if we're using the source recipient
+     if (!isValidStellarAddress(params.recipient)) {
+       throw new InvalidAddressError(params.recipient);
+     }
+     
+     // Create the new stream
+     const result = await this.createStream(params, signal, options);
+     
+     // clearStreamCache is called internally by createStream
+     
+     return {
+       streamId: result.streamId,
+       txHash: result.txHash,
+     };
+   }
+
+   // ── Fee estimation ────────────────────────────────────────────────────────
 
   private async estimateOperationFee(operation: xdr.Operation): Promise<FeeEstimate> {
     const adapter = this.requireWalletAdapter();
@@ -4534,53 +4699,75 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     pagination?: PaginationParams,
     filter?: StreamFilterCriteria,
   ): Promise<Stream[] | PaginatedStreams> {
-    // Issue #522: an empty-string tag is always invalid — callers cannot
-    // distinguish "no streams for this tag" from "invalid query".
-    if (tag.trim() === '') {
-      throw new SoroStreamError('tag must not be empty');
+    // Network-keyed cache for non-paginated calls (issue #230 & #342).
+    // When a filter is provided, bypass the cache so filtered results don't
+    // poison the unfiltered cache entry for subsequent calls.
+    const networkAtCallTime = this.network;
+    const cacheKey = `${networkAtCallTime}:${tag}`;
+    const hasFilter = filter !== undefined && Object.keys(filter).length > 0;
+    if (!pagination && !hasFilter) {
+      const cached = this.tagCache.get(cacheKey);
+      if (cached) return cached;
     }
 
-    const args: xdr.ScVal[] = [nativeToScVal(tag, { type: 'string' })];
+    return this.requestDedup.dedupe(
+      dedupKey('getStreamsByTag', networkAtCallTime, tag, pagination),
+      async (): Promise<Stream[] | PaginatedStreams> => {
+        // Issue #522: an empty-string tag is always invalid — callers cannot
+        // distinguish "no streams for this tag" from "invalid query".
+        if (tag.trim() === '') {
+          throw new SoroStreamError('tag must not be empty');
+        }
 
-    if (pagination) {
-      args.push(nativeToScVal(pagination.limit ?? 20, { type: 'u32' }));
-      args.push(
-        pagination.cursor != null
-          ? nativeToScVal(BigInt(pagination.cursor), { type: 'u64' })
-          : xdr.ScVal.scvVoid(),
-      );
-    }
+        const args: xdr.ScVal[] = [nativeToScVal(tag, { type: 'string' })];
 
-    const result = await withRetry(
-      () => this.simulateOp(this.contract.call('get_streams_by_tag', ...args)),
-      this.readRetry,
+        if (pagination) {
+          args.push(nativeToScVal(pagination.limit ?? 20, { type: 'u32' }));
+          args.push(
+            pagination.cursor != null
+              ? nativeToScVal(BigInt(pagination.cursor), { type: 'u64' })
+              : xdr.ScVal.scvVoid(),
+          );
+        }
+
+        const result = await withRetry(
+          () => this.simulateOp(this.contract.call('get_streams_by_tag', ...args)),
+          this.readRetry,
+        );
+
+        if (rpc.Api.isSimulationError(result)) {
+          return pagination ? { streams: [], cursor: null, hasMore: false } : [];
+        }
+
+        const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
+        if (!returnVal) {
+          return pagination ? { streams: [], cursor: null, hasMore: false } : [];
+        }
+
+        const raw = scValToNative(returnVal) as Record<string, unknown>[];
+        let streams = raw.map(nativeToStream);
+
+        if (filter && Object.keys(filter).length > 0) {
+          streams = filterStreams(streams, filter);
+        }
+
+        // Only cache non-paginated results, and only when the network hasn't
+        // switched mid-flight (mirrors the guard in getStream).
+        if (!pagination && networkAtCallTime === this.network) {
+          this.tagCache.set(cacheKey, streams);
+        }
+
+        if (!pagination) return streams;
+
+        const limit = pagination.limit ?? 20;
+        const last = streams[streams.length - 1];
+        return {
+          streams,
+          cursor: last ? last.id : null,
+          hasMore: streams.length >= limit,
+        };
+      },
     );
-
-    if (rpc.Api.isSimulationError(result)) {
-      return pagination ? { streams: [], cursor: null, hasMore: false } : [];
-    }
-
-    const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) {
-      return pagination ? { streams: [], cursor: null, hasMore: false } : [];
-    }
-
-    const raw = scValToNative(returnVal) as Record<string, unknown>[];
-    let streams = raw.map(nativeToStream);
-
-    if (filter && Object.keys(filter).length > 0) {
-      streams = filterStreams(streams, filter);
-    }
-
-    if (!pagination) return streams;
-
-    const limit = pagination.limit ?? 20;
-    const last = streams[streams.length - 1];
-    return {
-      streams,
-      cursor: last ? last.id : null,
-      hasMore: streams.length >= limit,
-    };
   }
 
   /**
@@ -6140,8 +6327,16 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
       }
       return [];
     });
-  }
 }
+   }
+   
+   // Issue #545: automatically invalidate cache when StreamCancelled contract events are received
+   this.streamCancelledSubscription = this.getEventPoller().subscribe(`hooks:StreamCancelled`, {
+     filter: (event) => event.type === 'StreamCancelled',
+     callback: (event) => {
+       this.clearStreamCache(event.streamId);
+     },
+   });
 
 /**
  * Factory function for constructing a {@link SoroStreamClient}. Equivalent to
