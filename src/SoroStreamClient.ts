@@ -124,6 +124,7 @@ import {
   SelfStreamError,
   RecipientValidationError,
   StartTimeInPastError,
+  StreamAlreadyLockedError,
 } from './errors.js';
 import type { BulkCreateFailedSlot } from './errors.js';
 import type {
@@ -138,6 +139,7 @@ import type {
   CreateStreamParams,
   CreateStreamDryRunResult,
   FeeEstimate,
+  SimulateStreamResult,
   Network,
   PaginatedStreams,
   PaginationParams,
@@ -3198,6 +3200,39 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     return { txHash };
   }
 
+  /**
+   * Sets or extends the lock expiration on an existing stream, preventing
+   * early cancellation or withdrawal until the specified timestamp (issue #557).
+   *
+   * @param streamId - ID of the stream to lock.
+   * @param timestamp - Unix timestamp in seconds until which the stream is locked.
+   * @returns `{ txHash }` — confirming transaction hash.
+   * @throws {StreamNotFoundError} If the stream does not exist.
+   * @throws {StreamAlreadyLockedError} If the stream already has a lockUntil
+   * that is equal to or later than the requested timestamp.
+   * @throws {TransactionFailedError} If the transaction is rejected.
+   */
+  async lockUntil(streamId: string, timestamp: Date): Promise<{ txHash: string }> {
+    const stream = await this.getStream(streamId);
+    const lockUntilSec = Math.floor(timestamp.getTime() / 1000);
+    if (stream.lockUntil !== undefined && stream.lockUntil >= lockUntilSec) {
+      throw new StreamAlreadyLockedError(streamId, stream.lockUntil, lockUntilSec);
+    }
+    const sender = await this.requireWalletAdapter().getPublicKey();
+    const operation = this.encoder.lockStream(streamId, sender, lockUntilSec);
+    const feeBump = this.resolveFeeBump(undefined);
+    const { txHash } = await this.buildAndSubmit(
+      operation,
+      undefined,
+      feeBump,
+      'lockUntil',
+      undefined,
+      undefined,
+    );
+    this.clearStreamCache(streamId);
+    return { txHash };
+  }
+
   // ── Fee estimation ────────────────────────────────────────────────────────
 
   private async estimateOperationFee(operation: xdr.Operation): Promise<FeeEstimate> {
@@ -3319,6 +3354,45 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     const totalInAsset = (totalFee / 10_000_000).toFixed(7);
 
     return { resourceFee, baseFee, totalFee, totalInAsset };
+  }
+
+  /**
+   * Dry-runs a `createStream` transaction via `simulateTransaction` and returns
+   * a structured result without submitting it to the network (issue #555).
+   *
+   * @param params - Same shape as {@link createStream}'s `params`.
+   * @returns `{ fee, footprint, isValid, error? }` where `isValid` indicates
+   * whether the simulation succeeded.
+   */
+  async simulateStream(params: CreateStreamParams): Promise<SimulateStreamResult> {
+    try {
+      const sender = await this.requireWalletAdapter().getPublicKey();
+      const operation = this.encoder.createStream(sender, params);
+      const simResult = await this.simulateOp(operation);
+      const isSuccess = rpc.Api.isSimulationSuccess(simResult);
+      if (isSuccess) {
+        const fee = Number(
+          (simResult as rpc.Api.SimulateTransactionSuccessResponse).minResourceFee ?? 0,
+        );
+        const raw = simResult as any;
+        const footprint = raw.footprint ?? { readOnly: [], readWrite: [] };
+        return { fee, footprint, isValid: true };
+      }
+      const error = (simResult as rpc.Api.SimulateTransactionErrorResponse).error;
+      return {
+        fee: 0,
+        footprint: { readOnly: [], readWrite: [] },
+        isValid: false,
+        error,
+      };
+    } catch (err) {
+      return {
+        fee: 0,
+        footprint: { readOnly: [], readWrite: [] },
+        isValid: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   /**
