@@ -38,6 +38,7 @@ import type { StorageAdapter, SoroStreamAdapters, FetchAdapter } from './adapter
 import { SoroStreamVersionError } from './errors.js';
 import type { TransactionHistoryOptions, TransactionHistoryPage } from './horizon.js';
 import { getTransactionHistory, getAddressActivity } from './horizon.js';
+import { Telemetry } from './telemetry.js';
 import {
   createDefaultRpcTransport,
   createRetryingRpcTransport,
@@ -661,8 +662,10 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
   private readonly logger: Logger;
   // Issue #391: timestamp of the most recent successful RPC call (ms)
   private lastRpcTimestampMs: number | null = null;
-  // Issue #270: telemetry opt-out flag
-  private readonly telemetryEnabled: boolean;
+// Issue #270: telemetry opt-out flag
+   private readonly telemetryEnabled: boolean;
+   // Issue #568: OpenTelemetry telemetry instance
+   private readonly telemetry: Telemetry;
   // Issue #199: injectable storage/fetch adapters (replace direct browser global use)
   private readonly storageAdapter: StorageAdapter | null;
   private readonly fetchAdapter: FetchAdapter;
@@ -899,10 +902,12 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
         : null;
     // Issue #271: RYOW timeout (0 = disabled for zero-overhead backward compat)
     this.ryowTimeoutMs = options.ryowTimeoutMs ?? 10_000;
-    // Issue #203: token metadata cache (10-minute default TTL)
-    this.tokenMetadataCache = new Cache<string, TokenMetadata>(
-      options.tokenMetadataTtlMs ?? 600_000,
-    );
+// Issue #203: token metadata cache (10-minute default TTL)
+     this.tokenMetadataCache = new Cache<string, TokenMetadata>(
+       options.tokenMetadataTtlMs ?? 600_000,
+     );
+     // Issue #568: Initialize OpenTelemetry
+     this.telemetry = new Telemetry(this.telemetryEnabled);
     // Issue #149: connection pool stats tracker
     this.connectionPool = {
       maxConnections: options.maxConnections ?? 5,
@@ -1302,9 +1307,21 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
    *
    * Issue #270.
    */
-  get isTelemetryEnabled(): boolean {
-    return this.telemetryEnabled;
-  }
+get isTelemetryEnabled(): boolean {
+     return this.telemetryEnabled;
+   }
+
+   /**
+    * Issue #568: Start a telemetry span for a method call.
+    * @param name - The span name
+    * @param attributes - Optional attributes to set on the span
+    * @returns The span, or null if telemetry is disabled
+    */
+   private startSpan(name: string, attributes?: Record<string, string | number | boolean>): import('./telemetry.js').Span | null {
+     if (!this.telemetryEnabled) return null;
+     const span = this.telemetry.startSpan(name, { attributes });
+     return span;
+   }
 
   /**
    * Returns a monotonically increasing version number that increments
@@ -2118,41 +2135,46 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
 
   // ── Token metadata cache (Issue #203) ────────────────────────────────────
 
-  /**
+/**
    * Fetches and caches the SAC token metadata (name, symbol, decimals).
    * Concurrent calls for the same token share a single in-flight request.
    */
   async getTokenMetadata(tokenAddress: string): Promise<TokenMetadata> {
-    const cached = this.tokenMetadataCache.get(tokenAddress);
-    if (cached) return cached;
+    // Issue #568: Add OpenTelemetry tracing span
+    const span = this.startSpan('getTokenMetadata', {
+      'token.address': tokenAddress
+    });
+    try {
+      const cached = this.tokenMetadataCache.get(tokenAddress);
+      if (cached) return cached;
 
-    // Issue #426: shared deduplication layer — concurrent callers for the same
-    // token wait on one set of RPC calls.
-    return this.requestDedup.dedupe(
-      dedupKey('getTokenMetadata', this.network, tokenAddress),
-      async (): Promise<TokenMetadata> => {
-        const tokenContract = new Contract(tokenAddress);
-        const [nameRes, symbolRes, decimalsRes] = await Promise.all([
-          this.simulateOp(tokenContract.call('name')),
-          this.simulateOp(tokenContract.call('symbol')),
-          this.simulateOp(tokenContract.call('decimals')),
-        ]);
-        const name = String(
-          scValToNative((nameRes as rpc.Api.SimulateTransactionSuccessResponse).result!.retval!),
-        );
-        const symbol = String(
-          scValToNative((symbolRes as rpc.Api.SimulateTransactionSuccessResponse).result!.retval!),
-        );
-        const decimals = Number(
-          scValToNative(
-            (decimalsRes as rpc.Api.SimulateTransactionSuccessResponse).result!.retval!,
-          ),
-        );
-        const metadata: TokenMetadata = { name, symbol, decimals };
-        this.tokenMetadataCache.set(tokenAddress, metadata);
-        return metadata;
-      },
-    );
+      // Issue #426: shared deduplication layer — concurrent callers for the same
+      // token wait on one set of RPC calls.
+      return this.requestDedup.dedupe(
+        dedupKey('getTokenMetadata', this.network, tokenAddress),
+        async (): Promise<TokenMetadata> => {
+          const tokenContract = new Contract(tokenAddress);
+          const [nameRes, symbolRes, decimalsRes] = await Promise.all([
+            this.simulateOp(tokenContract.call('name')),
+            this.simulateOp(tokenContract.call('symbol')),
+            this.simulateOp(tokenContract.call('decimals')),
+          ]);
+
+          const metadata: TokenMetadata = {
+            name: nameRes,
+            symbol: symbolRes,
+            decimals: decimalsRes,
+          };
+          this.tokenMetadataCache.set(tokenAddress, metadata);
+          return metadata;
+        },
+      );
+    } finally {
+      // Issue #568: End the span
+      if (span) {
+        this.telemetry.endSpan(span);
+      }
+    }
   }
 
   /** Clears token metadata cache entries. Without an argument, clears all. */
@@ -2172,14 +2194,25 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
    * Results are cached for the session.
    */
   async resolveFederationAddress(address: string): Promise<string | null> {
+    // Issue #568: Add OpenTelemetry tracing span
+    const span = this.startSpan('resolveFederationAddress', {
+      'federation.address': address
+    });
     try {
-      const cached = this.federationCache.get(address);
-      if (cached) return cached;
-      const resolved = await resolveFederationAddress(address);
-      this.federationCache.set(address, resolved);
-      return resolved;
-    } catch {
-      return null;
+      try {
+        const cached = this.federationCache.get(address);
+        if (cached) return cached;
+        const resolved = await resolveFederationAddress(address);
+        this.federationCache.set(address, resolved);
+        return resolved;
+      } catch {
+        return null;
+      }
+    } finally {
+      // Issue #568: End the span
+      if (span) {
+        this.telemetry.endSpan(span);
+      }
     }
   }
 
@@ -2354,56 +2387,65 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
     });
   }
 
-  async createStream(
-    params: CreateStreamParams,
-    signal?: AbortSignal,
-    options?: WriteOptions,
-  ): Promise<{ streamId: string; txHash: string } | CreateStreamDryRunResult> {
-    return this.runWithMiddleware('createStream', [params], async () => {
-      if (params.amount <= 0n) throw new InsufficientAmountError();
-      await this.validateCliff(params.cliffSeconds ?? 0);
+async createStream(
+     params: CreateStreamParams,
+     signal?: AbortSignal,
+     options?: WriteOptions,
+   ): Promise<{ streamId: string; txHash: string } | CreateStreamDryRunResult> {
+     return this.runWithMiddleware('createStream', [params], async () => {
+       // Issue #568: Add OpenTelemetry tracing span
+       const span = this.startSpan('createStream', {
+         'stream.recipient': params.recipient,
+         'stream.token': params.token,
+         'stream.amount': params.amount.toString(),
+         'stream.durationSeconds': params.durationSeconds,
+         'stream.cliffSeconds': params.cliffSeconds ?? 0
+       });
+       try {
+         if (params.amount <= 0n) throw new InsufficientAmountError();
+         await this.validateCliff(params.cliffSeconds ?? 0);
 
-      this.logger.info(
-        `createStream: creating stream for recipient ${params.recipient}, amount=${params.amount}, duration=${params.durationSeconds}s`,
-      );
+         this.logger.info(
+           `createStream: creating stream for recipient ${params.recipient}, amount=${params.amount}, duration=${params.durationSeconds}s`,
+         );
 
-      // Issue #231: Warn (or throw when strict:true) if the caller provides a
-      // nonce field but the contract does not support it.
-      if (params.nonce !== undefined) {
-        const nonceOk = await this.supportsNonce();
-        if (!nonceOk) {
-          if (options?.strict) {
-            throw new NonceNotSupportedError();
-          } else {
-            console.warn(
-              '[SoroStream SDK] createStream: nonce was provided but the deployed ' +
-                'contract does not support nonce-based idempotency. ' +
-                'Retries will NOT be deduplicated and may create duplicate streams. ' +
-                'Upgrade the contract or pass strict: true in WriteOptions to turn ' +
-                'this into an error.',
-            );
-          }
-        }
-      }
+         // Issue #231: Warn (or throw when strict:true) if the caller provides a
+         // nonce field but the contract does not support it.
+         if (params.nonce !== undefined) {
+           const nonceOk = await this.supportsNonce();
+           if (!nonceOk) {
+             if (options?.strict) {
+               throw new NonceNotSupportedError();
+             } else {
+               console.warn(
+                 '[SoroStream SDK] createStream: nonce was provided but the deployed ' +
+                   'contract does not support nonce-based idempotency. ' +
+                   'Retries will NOT be deduplicated and may create duplicate streams. ' +
+                   'Upgrade the contract or pass strict: true in WriteOptions to turn ' +
+                   'this into an error.',
+               );
+             }
+           }
+         }
 
-      // Resolve federation address if needed, with caching
-      if (isFederationAddress(params.recipient)) {
-        const cached = this.federationCache.get(params.recipient);
-        if (cached) {
-          params = { ...params, recipient: cached };
-        } else {
-          const resolved = await resolveFederationAddress(params.recipient, this.fetchAdapter);
-          this.federationCache.set(params.recipient, resolved);
-          params = { ...params, recipient: resolved };
-        }
-      }
+         // Resolve federation address if needed, with caching
+         if (isFederationAddress(params.recipient)) {
+           const cached = this.federationCache.get(params.recipient);
+           if (cached) {
+             params = { ...params, recipient: cached };
+           } else {
+             const resolved = await resolveFederationAddress(params.recipient, this.fetchAdapter);
+             this.federationCache.set(params.recipient, resolved);
+             params = { ...params, recipient: resolved };
+           }
+         }
 
-      const sender = await this.requireWalletAdapter().getPublicKey();
+         const sender = await this.requireWalletAdapter().getPublicKey();
 
-      // Issue #232: Prevent self-streaming (recipient === sender).
-      // Checked before validateStreamParams so SelfStreamError is never
-      // shadowed by an AccountNotFoundError from the on-chain account lookup.
-      if (params.recipient === sender) {
+         // Issue #232: Prevent self-streaming (recipient === sender).
+         // Checked before validateStreamParams so SelfStreamError is never
+         // shadowed by an AccountNotFoundError from the on-chain account lookup.
+         if (params.recipient === sender) {
         throw new SelfStreamError();
       }
 
@@ -2497,18 +2539,23 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
         this.namespaceRegistry.set(latest.id, params.namespace);
       }
 
-      // Issue #212: notify subscribers of the custom event bus.
-      this.eventBus.emit('stream.created', {
-        streamId: latest.id,
-        sender,
-        recipient: params.recipient,
-        token: params.token,
-        txHash,
-      });
+// Issue #212: notify subscribers of the custom event bus.
+       this.eventBus.emit('stream.created', {
+         streamId: latest.id,
+         sender,
+         recipient: params.recipient,
+         token: params.token,
+         txHash,
+       });
 
-      return { streamId: latest.id, txHash };
-    });
-  }
+       // Issue #568: End the span before returning
+       if (span) {
+         this.telemetry.endSpan(span);
+       }
+
+       return { streamId: latest.id, txHash };
+     });
+   }
 
   /**
    * Creates multiple payment streams in a single batched transaction.
@@ -2585,52 +2632,76 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
    * console.log(`Withdrew ${formatUSDC(BigInt(amount))} USDC — tx: ${txHash}`);
    * ```
    */
-  async withdraw(
-    params: WithdrawParams,
-    signal?: AbortSignal,
-    options?: WriteOptions,
-  ): Promise<{ txHash: string; amount: string }> {
-    const recipient = await this.requireWalletAdapter().getPublicKey();
-    const claimable = await this.getClaimable(params.streamId);
+async withdraw(
+     params: WithdrawParams,
+     signal?: AbortSignal,
+     options?: WriteOptions,
+   ): Promise<{ txHash: string; amount: string }> {
+     // Issue #568: Add OpenTelemetry tracing span
+     const span = this.startSpan('withdraw', {
+       'stream.id': params.streamId
+     });
+     try {
+       const recipient = await this.requireWalletAdapter().getPublicKey();
+       const claimable = await this.getClaimable(params.streamId);
 
-    this.logger.info(`withdraw: stream ${params.streamId}, claimable=${claimable}`);
-    const operation = this.encoder.withdraw(params.streamId, recipient);
+       this.logger.info(`withdraw: stream ${params.streamId}, claimable=${claimable}`);
+       const operation = this.encoder.withdraw(params.streamId, recipient);
 
-    // Issue #268: explain mode — return dry-run description without submitting.
-    if (options?.explain) {
-      const amountUsdc = formatUSDC(claimable);
-      // Fetch stream to get token address for balance delta.
-      const stream = await this.getStream(params.streamId).catch(() => null);
-      const tokenAddress = stream?.token ?? '(unknown token)';
-      return this.explainOperation(
-        operation,
-        'withdraw',
-        () => `Withdraw ${amountUsdc} USDC from stream ${params.streamId}`,
-        [recipient, tokenAddress],
-        () =>
-          claimable > 0n ? [{ address: recipient, token: tokenAddress, delta: claimable }] : [],
-      ) as unknown as { txHash: string; amount: string };
-    }
+       // Issue #268: explain mode — return dry-run description without submitting.
+       if (options?.explain) {
+         const amountUsdc = formatUSDC(claimable);
+         // Fetch stream to get token address for balance delta.
+         const stream = await this.getStream(params.streamId).catch(() => null);
+         const tokenAddress = stream?.token ?? '(unknown token)';
+         const result = this.explainOperation(
+           operation,
+           'withdraw',
+           () => `Withdraw ${amountUsdc} USDC from stream ${params.streamId}`,
+           [recipient, tokenAddress],
+           () =>
+             claimable > 0n ? [{ address: recipient, token: tokenAddress, delta: claimable }] : [],
+         ) as unknown as { txHash: string; amount: string };
+         
+         // Issue #568: End the span before returning
+         if (span) {
+           this.telemetry.endSpan(span);
+         }
+         return result;
+       }
 
-    const feeBump = this.resolveFeeBump(options?.feeBump);
-    const { txHash } = await this.buildAndSubmit(
-      operation,
-      signal,
-      feeBump,
-      'withdraw',
-      options?.memo,
-      options?.timeoutMs ?? options?.timeout,
-    );
+       const feeBump = this.resolveFeeBump(options?.feeBump);
+       const { txHash } = await this.buildAndSubmit(
+         operation,
+         signal,
+         feeBump,
+         'withdraw',
+         options?.memo,
+         options?.timeoutMs ?? options?.timeout,
+       );
 
-    // Issue #212: notify subscribers of the custom event bus.
-    this.eventBus.emit('stream.withdrawn', {
-      streamId: params.streamId,
-      amount: claimable.toString(),
-      txHash,
-    });
+       // Issue #212: notify subscribers of the custom event bus.
+       this.eventBus.emit('stream.withdrawn', {
+         streamId: params.streamId,
+         amount: claimable.toString(),
+         txHash,
+       });
 
-    return { txHash, amount: claimable.toString() };
-  }
+       // Issue #568: End the span before returning
+       if (span) {
+         this.telemetry.endSpan(span);
+       }
+
+       return { txHash, amount: claimable.toString() };
+     } catch (err) {
+       // Issue #568: Record error on span before re-throwing
+       if (span) {
+         this.telemetry.recordError(span, err instanceof Error ? err : new Error(String(err)));
+         this.telemetry.endSpan(span);
+       }
+       throw err;
+     }
+   }
 
   /**
    * Withdraws from multiple streams, collecting partial results instead of
@@ -2732,49 +2803,73 @@ export class SoroStreamClient<TEventData = Record<string, unknown>> {
    * const { txHash } = await client.cancelStream({ streamId: "42" });
    * ```
    */
-  async cancelStream(
-    params: CancelStreamParams,
-    signal?: AbortSignal,
-    options?: WriteOptions,
-  ): Promise<{ txHash: string }> {
-    const sender = await this.requireWalletAdapter().getPublicKey();
-    const operation = this.encoder.cancelStream(params.streamId, sender);
+async cancelStream(
+     params: CancelStreamParams,
+     signal?: AbortSignal,
+     options?: WriteOptions,
+   ): Promise<{ txHash: string }> {
+     // Issue #568: Add OpenTelemetry tracing span
+     const span = this.startSpan('cancelStream', {
+       'stream.id': params.streamId
+     });
+     try {
+       const sender = await this.requireWalletAdapter().getPublicKey();
+       const operation = this.encoder.cancelStream(params.streamId, sender);
 
-    // Issue #268: explain mode — return dry-run description without submitting.
-    if (options?.explain) {
-      const stream = await this.getStream(params.streamId).catch(() => null);
-      const tokenAddress = stream?.token ?? '(unknown token)';
-      // Estimate refund as the portion of deposit not yet streamed.
-      const now = Math.floor(Date.now() / 1000);
-      const elapsed = stream ? Math.max(0, now - stream.startTime) : 0;
-      const streamed = stream ? stream.flowRate * BigInt(elapsed) : 0n;
-      const refund = stream ? (stream.deposit > streamed ? stream.deposit - streamed : 0n) : 0n;
-      const refundUsdc = formatUSDC(refund);
-      return this.explainOperation(
-        operation,
-        'cancelStream',
-        () =>
-          `Cancel stream ${params.streamId} — refund estimated ${refundUsdc} USDC to sender ${sender}`,
-        [sender, tokenAddress],
-        () => (refund > 0n ? [{ address: sender, token: tokenAddress, delta: refund }] : []),
-      ) as unknown as { txHash: string };
-    }
+       // Issue #268: explain mode — return dry-run description without submitting.
+       if (options?.explain) {
+         const stream = await this.getStream(params.streamId).catch(() => null);
+         const tokenAddress = stream?.token ?? '(unknown token)';
+         // Estimate refund as the portion of deposit not yet streamed.
+         const now = Math.floor(Date.now() / 1000);
+         const elapsed = stream ? Math.max(0, now - stream.startTime) : 0;
+         const streamed = stream ? stream.flowRate * BigInt(elapsed) : 0n;
+         const refund = stream ? (stream.deposit > streamed ? stream.deposit - streamed : 0n) : 0n;
+         const refundUsdc = formatUSDC(refund);
+         const result = this.explainOperation(
+           operation,
+           'cancelStream',
+           () =>
+             `Cancel stream ${params.streamId} — refund estimated ${refundUsdc} USDC to sender ${sender}`,
+           [sender, tokenAddress],
+           () => (refund > 0n ? [{ address: sender, token: tokenAddress, delta: refund }] : []),
+         ) as unknown as { txHash: string };
+         
+         // Issue #568: End the span before returning
+         if (span) {
+           this.telemetry.endSpan(span);
+         }
+         return result;
+       }
 
-    const feeBump = this.resolveFeeBump(options?.feeBump);
-    const { txHash } = await this.buildAndSubmit(
-      operation,
-      signal,
-      feeBump,
-      'cancelStream',
-      options?.memo,
-      options?.timeoutMs ?? options?.timeout,
-    );
+       const feeBump = this.resolveFeeBump(options?.feeBump);
+       const { txHash } = await this.buildAndSubmit(
+         operation,
+         signal,
+         feeBump,
+         'cancelStream',
+         options?.memo,
+         options?.timeoutMs ?? options?.timeout,
+       );
 
-    // Issue #212: notify subscribers of the custom event bus.
-    this.eventBus.emit('stream.cancelled', { streamId: params.streamId, txHash });
+       // Issue #212: notify subscribers of the custom event bus.
+       this.eventBus.emit('stream.cancelled', { streamId: params.streamId, txHash });
 
-    return { txHash };
-  }
+       // Issue #568: End the span before returning
+       if (span) {
+         this.telemetry.endSpan(span);
+       }
+
+       return { txHash };
+     } catch (err) {
+       // Issue #568: Record error on span before re-throwing
+       if (span) {
+         this.telemetry.recordError(span, err instanceof Error ? err : new Error(String(err)));
+         this.telemetry.endSpan(span);
+       }
+       throw err;
+     }
+   }
 
   /**
    * Tops up an existing stream with additional tokens, extending its duration.
