@@ -3,6 +3,7 @@ import noWithdrawWithoutClaimableCheck from './rules/no-withdraw-without-claimab
 import awaitAsyncSdkMethods from './rules/await-async-sdk-methods.js';
 import noHardcodedContractId from './rules/no-hardcoded-contract-id.js';
 import noSecretKeyExposure from './rules/no-secret-key-exposure.js';
+import noMagicFlowRate from './rules/no-magic-flow-rate.js';
 
 const PLUGIN_NAME = '@sorostream';
 
@@ -11,6 +12,7 @@ const rules = {
   'await-async-sdk-methods': awaitAsyncSdkMethods,
   'no-hardcoded-contract-id': noHardcodedContractId,
   'no-secret-key-exposure': noSecretKeyExposure,
+  'no-magic-flow-rate': noMagicFlowRate,
 };
 
 const recommendedRules: Linter.RulesRecord = {
@@ -18,6 +20,7 @@ const recommendedRules: Linter.RulesRecord = {
   '@sorostream/await-async-sdk-methods': 'warn',
   '@sorostream/no-hardcoded-contract-id': 'warn',
   '@sorostream/no-secret-key-exposure': 'error',
+  '@sorostream/no-magic-flow-rate': 'warn',
 };
 
 const plugin: ESLint.Plugin = {
