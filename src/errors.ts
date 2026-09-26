@@ -48,6 +48,15 @@ export class TransactionFailedError extends SoroStreamError {
   }
 }
 
+export class RateLimitExceededError extends SoroStreamError {
+  constructor(queueDepth: number, queueLimit: number) {
+    super(`Rate limit exceeded: ${queueDepth}/${queueLimit}`);
+    this.name = 'RateLimitExceededError';
+    this.queueDepth = queueDepth;
+    this.queueLimit = queueLimit;
+  }
+}
+
 export class InvalidAddressError extends SoroStreamError {
   constructor(address: string) {
     super(`Invalid Stellar address: ${address}`);
