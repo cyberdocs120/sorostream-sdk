@@ -158,7 +158,9 @@ export {
   SoroStreamTransportError,
   InsecureRpcUrlError,
   SdkNetworkError,
+  XdrValidationError,
 } from './errors.js';
+export type { XdrValidationErrorCode } from './errors.js';
 export { assertEnvelopeUnmutated } from './xdrValidation.js';
 export { checkPeerDependencies } from './peerDependencies.js';
 export {
