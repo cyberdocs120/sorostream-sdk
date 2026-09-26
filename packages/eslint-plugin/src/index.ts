@@ -1,5 +1,6 @@
 import type { ESLint, Linter } from 'eslint';
 import noWithdrawWithoutClaimableCheck from './rules/no-withdraw-without-claimable-check.js';
+import requireClaimableBeforeWithdraw from './rules/require-claimable-before-withdraw.js';
 import awaitAsyncSdkMethods from './rules/await-async-sdk-methods.js';
 import noHardcodedContractId from './rules/no-hardcoded-contract-id.js';
 import noSecretKeyExposure from './rules/no-secret-key-exposure.js';
@@ -9,6 +10,7 @@ const PLUGIN_NAME = '@sorostream';
 
 const rules = {
   'no-withdraw-without-claimable-check': noWithdrawWithoutClaimableCheck,
+  'require-claimable-before-withdraw': requireClaimableBeforeWithdraw,
   'await-async-sdk-methods': awaitAsyncSdkMethods,
   'no-hardcoded-contract-id': noHardcodedContractId,
   'no-secret-key-exposure': noSecretKeyExposure,
@@ -17,6 +19,7 @@ const rules = {
 
 const recommendedRules: Linter.RulesRecord = {
   '@sorostream/no-withdraw-without-claimable-check': 'warn',
+  '@sorostream/require-claimable-before-withdraw': 'warn',
   '@sorostream/await-async-sdk-methods': 'warn',
   '@sorostream/no-hardcoded-contract-id': 'warn',
   '@sorostream/no-secret-key-exposure': 'error',
